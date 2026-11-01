@@ -41,6 +41,9 @@ def install(*, register_protocol: bool = False) -> None:
         raise ValueError("Run the installer as your regular user, not root")
     import yaml  # noqa: F401 -- verify the runtime dependency before installing
 
+    if not shutil.which("zenity"):
+        raise ValueError("Zenity is required; install the zenity package first")
+
     home = Path.home()
     data = Path(os.environ.get("XDG_DATA_HOME", str(home / ".local/share")))
     if not data.is_absolute():

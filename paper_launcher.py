@@ -8,7 +8,9 @@ import base64
 import binascii
 import fcntl
 import hashlib
+import http.client
 import json
+import logging
 import math
 import os
 import platform
@@ -19,6 +21,7 @@ import sys
 import tarfile
 import tempfile
 import time
+import tomllib
 import urllib.parse
 import urllib.request
 from pathlib import Path, PurePosixPath
@@ -29,10 +32,10 @@ import yaml
 # Taken from resources/app-update.yml in Paper's official Linux DEB.
 RELEASE_BASE = "https://download.todesktop.com/2601167vjw8xe/"
 CHECK_INTERVAL = 24 * 60 * 60
-RETRY_INTERVAL = 60 * 60
 MAX_DOWNLOAD = 1024 * 1024 * 1024
 MAX_EXTRACTED = 2 * MAX_DOWNLOAD
 VERSION = "0.1.0"
+log = logging.getLogger("paper-launcher")
 
 
 class Release(TypedDict):
@@ -65,11 +68,15 @@ class HTTPSRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def open_url(url: str, timeout: int = 15):
+def open_url(url: str, timeout: int = 15, *, offset: int = 0):
     if urllib.parse.urlsplit(url).scheme != "https":
         raise LauncherError("Downloads must use HTTPS")
     opener = urllib.request.build_opener(HTTPSRedirect())
-    request = urllib.request.Request(url, headers={"User-Agent": f"paper-launcher/{VERSION}"})
+    headers = {"User-Agent": f"paper-launcher/{VERSION}"}
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
+        headers["Accept-Encoding"] = "identity"
+    request = urllib.request.Request(url, headers=headers)
     return opener.open(request, timeout=timeout)
 
 
@@ -98,7 +105,9 @@ def parse_metadata(document: Any, arch: str) -> Release:
         raise LauncherError("Invalid update metadata")
     version = document.get("version")
     files = document.get("files")
-    if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", version):
+    if not isinstance(version, str) or not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9.+_~:-]{0,127}", version
+    ):
         raise LauncherError("Invalid release version")
     if not isinstance(files, list):
         raise LauncherError("Missing release files")
@@ -109,10 +118,8 @@ def parse_metadata(document: Any, arch: str) -> Release:
         name = entry.get("url")
         if not isinstance(name, str) or not name.endswith(f"-{arch}.deb"):
             continue
-        if not re.fullmatch(r"paper-desktop-[A-Za-z0-9.+_-]+\.deb", name):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_~-]*\.deb", name):
             raise LauncherError("Unsafe DEB URL in update metadata")
-        if not name.startswith(f"paper-desktop-{version}-"):
-            raise LauncherError("Release filename does not match its version")
         size = entry.get("size")
         digest = entry.get("sha512")
         if type(size) is not int or not 0 < size <= MAX_DOWNLOAD:
@@ -137,19 +144,99 @@ def parse_metadata(document: Any, arch: str) -> Release:
     return matches[0]
 
 
-def download(release: Release, destination: Path) -> None:
+class Progress:
+    """Best-effort graphical progress; failure never affects the update."""
+
+    def __init__(self) -> None:
+        self.process: subprocess.Popen[str] | None = None
+        if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and shutil.which(
+            "zenity"
+        ):
+            try:
+                self.process = subprocess.Popen(
+                    [
+                        "zenity",
+                        "--progress",
+                        "--title=Downloading Paper",
+                        "--text=Downloading…",
+                        "--no-cancel",
+                        "--auto-close",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+            except OSError:
+                log.debug("Could not start Zenity", exc_info=True)
+
+    def update(self, percent: int) -> None:
+        if self.process and self.process.stdin:
+            try:
+                self.process.stdin.write(f"{percent}\n")
+                self.process.stdin.flush()
+            except (OSError, ValueError):
+                log.debug("Zenity progress unavailable", exc_info=True)
+
+    def close(self) -> None:
+        if self.process:
+            try:
+                if self.process.stdin:
+                    self.process.stdin.close()
+                if self.process.poll() is None:
+                    self.process.terminate()
+                self.process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+            except OSError:
+                pass
+
+
+def download(release: Release, destination: Path, *, attempts: int = 5, timeout: int = 30) -> None:
     digest = hashlib.sha512()
     size = 0
-    deadline = time.monotonic() + 15 * 60
-    with open_url(release["url"], timeout=30) as response, destination.open("xb") as output:
-        while chunk := response.read(1024 * 1024):
-            size += len(chunk)
-            if size > release["size"] or time.monotonic() > deadline:
-                raise LauncherError("Download exceeded its expected size or time limit")
-            digest.update(chunk)
-            output.write(chunk)
-    if size != release["size"] or digest.hexdigest() != release["sha512"]:
-        raise LauncherError("DEB size/checksum mismatch; existing installation was not changed")
+    progress = Progress()
+    try:
+        with destination.open("xb") as output:
+            for attempt in range(attempts):
+                try:
+                    kwargs = {"timeout": timeout}
+                    if size:
+                        kwargs["offset"] = size
+                    with open_url(release["url"], **kwargs) as response:
+                        if size:
+                            content_range = getattr(response, "headers", {}).get(
+                                "Content-Range", ""
+                            )
+                            expected_range = f"bytes {size}-{release['size'] - 1}/{release['size']}"
+                            status = getattr(response, "status", 200)
+                            if status != 206 or content_range != expected_range:
+                                # A server may ignore Range; restart rather than append incorrect bytes.
+                                output.seek(0)
+                                output.truncate()
+                                size = 0
+                                digest = hashlib.sha512()
+                                if status == 206:
+                                    raise OSError("Invalid partial download response")
+                        while chunk := response.read(1024 * 1024):
+                            size += len(chunk)
+                            if size > release["size"]:
+                                raise LauncherError("Download exceeded its expected size")
+                            digest.update(chunk)
+                            output.write(chunk)
+                            progress.update(size * 100 // release["size"])
+                    if size == release["size"]:
+                        break
+                    raise OSError("Incomplete download")
+                except (OSError, EOFError, http.client.HTTPException) as exc:
+                    log.warning("Download attempt %s/%s failed: %s", attempt + 1, attempts, exc)
+                    if attempt + 1 == attempts:
+                        raise LauncherError("Download failed after retries") from exc
+        if size != release["size"] or digest.hexdigest() != release["sha512"]:
+            raise LauncherError("DEB size/checksum mismatch; existing installation was not changed")
+    finally:
+        progress.close()
 
 
 def unpack_deb(deb: Path, destination: Path) -> None:
@@ -158,6 +245,7 @@ def unpack_deb(deb: Path, destination: Path) -> None:
         if source.read(8) != b"!<arch>\n":
             raise LauncherError("Download is not a Debian package")
         members: dict[str, Path] = {}
+        total = 0
         while header := source.read(60):
             if len(header) != 60 or header[58:] != b"`\n":
                 raise LauncherError("Invalid Debian archive header")
@@ -166,10 +254,13 @@ def unpack_deb(deb: Path, destination: Path) -> None:
                 size = int(header[48:58])
             except (UnicodeError, ValueError) as exc:
                 raise LauncherError("Invalid Debian archive member") from exc
-            if not re.fullmatch(r"(?:debian-binary|(?:control|data)\.tar\.(?:xz|gz|bz2))", name):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.+_-]*", name):
                 raise LauncherError(f"Unsupported Debian archive member: {name}")
             if name in members or not 0 <= size <= MAX_DOWNLOAD:
                 raise LauncherError("Invalid or duplicate Debian archive member")
+            total += size
+            if total > MAX_DOWNLOAD or len(members) >= 1000:
+                raise LauncherError("Debian archive exceeds member limits")
             target = Path(work) / name
             with target.open("xb") as output:
                 copy_exact(source, output, size)
@@ -178,7 +269,11 @@ def unpack_deb(deb: Path, destination: Path) -> None:
             members[name] = target
         if "debian-binary" not in members or members["debian-binary"].read_bytes() != b"2.0\n":
             raise LauncherError("Unsupported Debian package format")
-        payloads = [path for name, path in members.items() if name.startswith("data.tar.")]
+        payloads = [
+            path
+            for name, path in members.items()
+            if name == "data.tar" or name.startswith("data.tar.")
+        ]
         if len(payloads) != 1:
             raise LauncherError("Missing or ambiguous Debian payload")
         extract_payload(payloads[0], destination)
@@ -216,34 +311,84 @@ def extract_payload(payload: Path, destination: Path) -> None:
                 or name == "usr/share/icons/hicolor/256x256/apps/paper-desktop.png"
             ):
                 continue
-            # Paper's current DEB has no links. Fail closed if that changes.
-            if not (safe.isfile() or safe.isdir()):
-                raise LauncherError("Unexpected link or special file in Paper payload")
+            if safe.issym():
+                if not name.startswith("opt/Paper/") or os.path.isabs(safe.linkname):
+                    raise LauncherError("Unsafe symlink in Paper payload")
+                target = (destination / name).parent / safe.linkname
+                if not target.resolve().is_relative_to((destination / "opt/Paper").resolve()):
+                    raise LauncherError("Unsafe symlink in Paper payload")
+            elif not (safe.isfile() or safe.isdir()):
+                raise LauncherError("Unexpected hard link or special file in Paper payload")
             archive.extract(safe, destination, filter="data")
     executable = destination / "opt/Paper/paper-desktop"
     if not executable.is_file() or not os.access(executable, os.X_OK):
         raise LauncherError("DEB does not contain an executable Paper application")
 
 
-def notify(message: str, *, error: bool = False) -> None:
+def show_error(message: str) -> None:
+    """Report errors in the terminal and, when available, on the desktop."""
     print(f"paper-launcher: {message}", file=sys.stderr)
-    if shutil.which("notify-send"):
+    if (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")) and shutil.which("zenity"):
         try:
             subprocess.run(
-                [
-                    "notify-send",
-                    "--app-name=Paper Launcher",
-                    "--urgency=" + ("critical" if error else "normal"),
-                    "Paper",
-                    message,
-                ],
-                timeout=3,
+                ["zenity", "--error", "--no-markup", "--title=Paper Launcher", "--text", message],
                 check=False,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError:
             pass
+
+
+class Config(TypedDict):
+    extra_arguments: list[str]
+    extra_env_vars: dict[str, str]
+    download_attempts: int
+    timeout: int
+
+
+def load_config() -> Config:
+    config_home = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    if not config_home.is_absolute():
+        raise LauncherError("XDG_CONFIG_HOME must be an absolute path")
+    paths = (config_home / "paper-launcher.conf", Path("/etc/paper-launcher.conf"))
+    data: dict[str, Any] = {}
+    for path in paths:
+        try:
+            with path.open("rb") as source:
+                data = tomllib.load(source)
+            log.info("Loaded configuration from %s", path)
+            break
+        except FileNotFoundError:
+            continue
+        except (OSError, tomllib.TOMLDecodeError) as exc:
+            raise LauncherError(f"Cannot load configuration {path}: {exc}") from exc
+    section = data.get("paper", {})
+    if not isinstance(section, dict):
+        raise LauncherError("Configuration [paper] must be a table")
+    arguments = section.get("extra_arguments", [])
+    environment = section.get("extra_env_vars", [])
+    attempts = section.get("download_attempts", 5)
+    timeout = section.get("timeout", 30)
+    if not isinstance(arguments, list) or not all(isinstance(x, str) for x in arguments):
+        raise LauncherError("extra_arguments must be an array of strings")
+    if not isinstance(environment, list) or not all(
+        isinstance(x, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=[^\x00]*", x)
+        for x in environment
+    ):
+        raise LauncherError("extra_env_vars must be an array of NAME=value strings")
+    if any("\x00" in x for x in arguments):
+        raise LauncherError("Arguments cannot contain NUL bytes")
+    if type(attempts) is not int or not 1 <= attempts <= 100:
+        raise LauncherError("download_attempts must be between 1 and 100")
+    if type(timeout) is not int or not 1 <= timeout <= 3600:
+        raise LauncherError("timeout must be between 1 and 3600 seconds")
+    return {
+        "extra_arguments": arguments,
+        "extra_env_vars": dict(x.split("=", 1) for x in environment),
+        "download_attempts": attempts,
+        "timeout": timeout,
+    }
 
 
 class Installation:
@@ -251,14 +396,49 @@ class Installation:
         self.root = root
         self.releases = root / "releases"
         self.state_path = root / "state.json"
+        self.invalid_state: bytes | None = None
 
     def read_state(self) -> State:
         try:
-            state = json.loads(self.state_path.read_text())
+            content = self.state_path.read_bytes()
         except FileNotFoundError:
             return {}
-        except (ValueError, UnicodeError) as exc:
-            raise LauncherError("Invalid launcher state; restore state.json from backup") from exc
+        try:
+            return self.parse_state(json.loads(content))
+        except (ValueError, UnicodeError, LauncherError) as exc:
+            return self.recover_state(content, exc)
+
+    def recover_state(self, content: bytes, error: Exception) -> State:
+        candidates: list[InstalledRelease] = []
+        if self.releases.is_dir():
+            for path in self.releases.iterdir():
+                if (
+                    path.is_symlink()
+                    or not path.is_dir()
+                    or not re.fullmatch(r"[a-f0-9]{128}", path.name)
+                ):
+                    continue
+                marker = path / ".paper-launcher-release"
+                try:
+                    if marker.is_symlink() or marker.read_text() != path.name:
+                        continue
+                    candidate: InstalledRelease = {"id": path.name, "version": "unknown"}
+                    if self.executable(candidate):
+                        candidates.append(candidate)
+                except (OSError, UnicodeError):
+                    continue
+        if len(candidates) != 1:
+            raise LauncherError(
+                "Invalid launcher state and no unambiguous installed release; restore state.json from backup"
+            ) from error
+        self.invalid_state = content
+        log.warning(
+            "Invalid launcher state; recovered the only marked installation (version unknown)"
+        )
+        return {"current": candidates[0]}
+
+    @staticmethod
+    def parse_state(state: Any) -> State:
         if not isinstance(state, dict):
             raise LauncherError("Invalid launcher state")
         # Ignore obsolete state from launcher versions with manual release switching.
@@ -283,6 +463,15 @@ class Installation:
 
     def save_state(self, state: State) -> None:
         # One atomic pointer update selects the validated release.
+        if self.invalid_state is not None:
+            with tempfile.NamedTemporaryFile(
+                prefix="state.invalid-", dir=self.root, delete=False
+            ) as backup:
+                backup.write(self.invalid_state)
+                backup.flush()
+                os.fsync(backup.fileno())
+            log.warning("Saved invalid launcher state to %s", backup.name)
+            self.invalid_state = None
         with tempfile.NamedTemporaryFile(mode="w", dir=self.root, delete=False) as output:
             pending = Path(output.name)
             try:
@@ -300,28 +489,28 @@ class Installation:
         path = self.releases / entry["id"] / "opt/Paper/paper-desktop"
         return path if path.is_file() and os.access(path, os.X_OK) else None
 
-    def update(self, state: State, arch: str, *, force: bool = False) -> None:
+    def update(
+        self, state: State, arch: str, *, force: bool = False, attempts: int = 5, timeout: int = 30
+    ) -> None:
         now = time.time()
         if not force and self.executable(state.get("current")):
-            if now - state.get("last_check", 0) < CHECK_INTERVAL:
+            if 0 <= now - state.get("last_check", 0) < CHECK_INTERVAL:
                 return
-            if now - state.get("last_attempt", 0) < RETRY_INTERVAL:
-                return
-        state["last_attempt"] = now
-        self.save_state(state)
         release = release_metadata(arch)
         current = state.get("current")
         if current and current["id"] == release["sha512"] and self.executable(current):
+            current["version"] = release["version"]
             state.update(last_check=now)
             self.save_state(state)
             self.prune(state)
             return
-        notify(f"Downloading Paper {release['version']}…")
+        log.info("Downloading Paper %s", release["version"])
         self.releases.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(prefix=".staging-", dir=self.releases) as work:
             staging = Path(work)
             deb = staging / "paper.deb"
-            download(release, deb)
+            download(release, deb, attempts=attempts, timeout=timeout)
+            log.info("Installing Paper %s", release["version"])
             extracted = staging / "root"
             extracted.mkdir()
             unpack_deb(deb, extracted)
@@ -357,7 +546,7 @@ class Installation:
                 except OSError as exc:
                     print(f"paper-launcher: Could not update the menu icon: {exc}", file=sys.stderr)
             self.prune(state)
-        notify(f"Paper {release['version']} is ready")
+        log.info("Paper %s is ready", release["version"])
 
     def prune(self, state: State) -> None:
         current = state.get("current")
@@ -389,6 +578,22 @@ def parser() -> argparse.ArgumentParser:
     actions.add_argument(
         "--skip-update", action="store_true", help="launch installed Paper without checking"
     )
+    actions.add_argument(
+        "--check-update", action="store_true", help="check for updates now, then launch"
+    )
+    actions.add_argument(
+        "--print-deb-url", action="store_true", help="print the latest package URL and exit"
+    )
+    result.add_argument(
+        "--no-exec", action="store_true", help="show the launch command without launching Paper"
+    )
+    result.add_argument(
+        "-v", "--verbose", action="count", default=0, help="increase diagnostic logging"
+    )
+    result.add_argument("--download-attempts", type=int, help="maximum download attempts (1–100)")
+    result.add_argument(
+        "--timeout", type=int, help="download connection timeout in seconds (1–3600)"
+    )
     result.add_argument("--version", action="version", version=f"paper-launcher {VERSION}")
     result.add_argument("paper_args", nargs=argparse.REMAINDER, help="Paper arguments, after --")
     return result
@@ -396,21 +601,39 @@ def parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(levelname)s: %(message)s",
+    )
     if os.geteuid() == 0:
         raise LauncherError("Run paper-launcher as your normal user, not root")
+    if not shutil.which("zenity"):
+        raise LauncherError("Zenity is required; install the zenity package")
+    config = load_config()
+    attempts = (
+        args.download_attempts
+        if args.download_attempts is not None
+        else config["download_attempts"]
+    )
+    timeout = args.timeout if args.timeout is not None else config["timeout"]
+    if not 1 <= attempts <= 100 or not 1 <= timeout <= 3600:
+        raise LauncherError("Download attempts must be 1–100 and timeout must be 1–3600 seconds")
+    if args.print_deb_url:
+        print(release_metadata(architecture())["url"])
+        return 0
     data = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share")))
     if not data.is_absolute():
         raise LauncherError("XDG_DATA_HOME must be an absolute path")
     installation = Installation(data / "paper-launcher")
     installation.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    # Held until the child exits: updates never replace files beneath a running app.
+    # The lock is passed to Paper so updates cannot replace files while it runs.
     with (installation.root / "launcher.lock").open("a+") as lock:
         exclusive = True
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             exclusive = False
-            if args.update:
+            if args.update or args.check_update:
                 raise LauncherError(
                     "Paper or its updater is running. Close it before updating."
                 ) from None
@@ -432,11 +655,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if exclusive and not args.skip_update:
             try:
-                installation.update(state, architecture(), force=args.update)
+                installation.update(
+                    state,
+                    architecture(),
+                    force=args.update or args.check_update,
+                    attempts=attempts,
+                    timeout=timeout,
+                )
             except (LauncherError, OSError, ValueError, tarfile.TarError) as exc:
                 if args.update or not installation.executable(state.get("current")):
                     raise LauncherError(f"Update failed: {exc}") from exc
-                notify(f"Update failed; opening installed Paper. {exc}")
+                show_error(f"Update failed; opening installed Paper. {exc}")
         if args.update:
             return 0
         executable = installation.executable(state.get("current"))
@@ -446,25 +675,29 @@ def main(argv: list[str] | None = None) -> int:
         paper_args = args.paper_args
         if paper_args[:1] == ["--"]:
             paper_args = paper_args[1:]
+        paper_args = [*config["extra_arguments"], *paper_args]
         # ToDesktop disables its Linux updater outside AppImage. Do not let an
         # AppImage-based terminal/parent falsely identify this extracted DEB.
         environment = os.environ.copy()
+        environment.update(config["extra_env_vars"])
         environment.pop("APPIMAGE", None)
         environment.pop("APPDIR", None)
+        if args.no_exec:
+            import shlex
+
+            print(shlex.join([str(executable), *paper_args]))
+            return 0
         # No shell interpolation, no --no-sandbox fallback, and keep argv URLs intact.
-        return subprocess.call(
-            [str(executable), *paper_args],
-            cwd=executable.parent,
-            pass_fds=(lock.fileno(),),
-            env=environment,
-        )
+        os.chdir(executable.parent)
+        os.set_inheritable(lock.fileno(), True)
+        os.execve(executable, [str(executable), *paper_args], environment)
 
 
 def entrypoint() -> None:
     try:
         sys.exit(main())
     except (LauncherError, OSError, ValueError, tarfile.TarError) as exc:
-        notify(str(exc), error=True)
+        show_error(str(exc))
         sys.exit(1)
     except KeyboardInterrupt:
         sys.exit(130)

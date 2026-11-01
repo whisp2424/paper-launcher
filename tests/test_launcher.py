@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import hashlib
 import io
 import json
@@ -77,9 +78,6 @@ class LauncherTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
         self.installation = launcher.Installation(self.root)
-        self.notifications = patch.object(launcher, "notify")
-        self.notifications.start()
-        self.addCleanup(self.notifications.stop)
 
     def update(self, state: dict, version: str = "0.5.16"):
         content = deb_bytes(version)
@@ -111,11 +109,10 @@ class LauncherTests(unittest.TestCase):
             with self.subTest(key=key, value=value), self.assertRaises(launcher.LauncherError):
                 launcher.parse_metadata(document, "amd64")
 
-    def test_metadata_rejects_version_mismatch_and_duplicates(self):
+    def test_metadata_accepts_different_filename_version_and_rejects_duplicates(self):
         document = metadata(b"data")
         document["version"] = "0.9.0"
-        with self.assertRaises(launcher.LauncherError):
-            launcher.parse_metadata(document, "amd64")
+        self.assertEqual(launcher.parse_metadata(document, "amd64")["version"], "0.9.0")
         document = metadata(b"data")
         document["files"] *= 2
         with self.assertRaises(launcher.LauncherError):
@@ -132,7 +129,11 @@ class LauncherTests(unittest.TestCase):
     def test_download_rejects_modified_and_truncated_content(self):
         release = launcher.parse_metadata(metadata(b"good"), "amd64")
         for number, content in enumerate((b"evil", b"goo", b"good-extra")):
-            with patch.object(launcher, "open_url", return_value=io.BytesIO(content)):
+            with patch.object(
+                launcher,
+                "open_url",
+                side_effect=lambda *a, content=content, **kw: io.BytesIO(content),
+            ):
                 with self.assertRaises(launcher.LauncherError):
                     launcher.download(release, self.root / f"bad-{number}.deb")
 
@@ -186,16 +187,19 @@ class LauncherTests(unittest.TestCase):
                 self.installation.save_state(replacement)
         self.assertEqual(self.installation.read_state(), before)
 
-    def test_daily_check_and_offline_retry_interval(self):
+    def test_daily_check_and_immediate_retry_after_failure(self):
         state = {}
         self.update(state)
         with patch.object(launcher, "release_metadata") as upstream:
             self.installation.update(state, "amd64")
             upstream.assert_not_called()
         state["last_check"] = 0
-        with patch.object(launcher, "release_metadata") as upstream:
-            self.installation.update(state, "amd64")
-            upstream.assert_not_called()
+        with patch.object(launcher, "release_metadata", side_effect=OSError("offline")) as upstream:
+            with self.assertRaises(OSError):
+                self.installation.update(state, "amd64")
+            with self.assertRaises(OSError):
+                self.installation.update(state, "amd64")
+            self.assertEqual(upstream.call_count, 2)
 
     def test_legacy_state_does_not_pause_updates(self):
         state = {}
@@ -225,7 +229,6 @@ class LauncherTests(unittest.TestCase):
                 ("../../escaped", b"danger", 0o644),
                 ("/tmp/escaped", b"danger", 0o644),
                 ("opt/Paper/link", "../../outside", 0o777),
-                ("opt/Paper/link", "paper-desktop", 0o777),
             )
         ):
             payload = self.root / f"payload-{index}.tar.xz"
@@ -241,6 +244,21 @@ class LauncherTests(unittest.TestCase):
             output.mkdir()
             with self.assertRaises((launcher.LauncherError, tarfile.TarError)):
                 launcher.extract_payload(payload, output)
+
+    def test_tar_allows_safe_relative_symlink(self):
+        payload = self.root / "safe.tar.xz"
+        payload.write_bytes(
+            tar_bytes(
+                [
+                    ("opt/Paper/paper-desktop", b"binary", 0o755),
+                    ("opt/Paper/link", "paper-desktop", 0o777),
+                ]
+            )
+        )
+        output = self.root / "safe"
+        output.mkdir()
+        launcher.extract_payload(payload, output)
+        self.assertEqual((output / "opt/Paper/link").read_bytes(), b"binary")
 
     def test_corrupt_and_truncated_deb_are_rejected(self):
         for index, content in enumerate((b"not a deb", deb_bytes()[:-100])):
@@ -272,6 +290,31 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaises(launcher.LauncherError):
                 self.installation.read_state()
 
+    def test_invalid_state_recovers_unique_install_and_preserves_original(self):
+        state = {}
+        release = self.update(state)
+        self.installation.state_path.write_bytes(b"invalid state")
+        recovered = self.installation.read_state()
+        self.assertEqual(recovered["current"]["id"], release["sha512"])
+        self.assertEqual(recovered["current"]["version"], "unknown")
+        with patch.object(launcher, "release_metadata", return_value=release):
+            self.installation.update(recovered, "amd64")
+        self.assertEqual(recovered["current"]["version"], release["version"])
+        backups = list(self.root.glob("state.invalid-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0].read_bytes(), b"invalid state")
+
+    def test_invalid_state_with_multiple_releases_is_not_recovered(self):
+        state = {}
+        first = self.update(state)
+        with patch.object(self.installation, "prune"):
+            second = self.update(state, "0.5.17")
+        self.assertNotEqual(first["sha512"], second["sha512"])
+        self.installation.state_path.write_bytes(b"invalid state")
+        with self.assertRaises(launcher.LauncherError):
+            self.installation.read_state()
+        self.assertEqual(self.installation.state_path.read_bytes(), b"invalid state")
+
     def test_cli_forwards_protocol_url_without_shell_interpolation(self):
         state = {}
         root = self.root / "paper-launcher"
@@ -288,13 +331,15 @@ class LauncherTests(unittest.TestCase):
                     "APPDIR": "/fixture/parent",
                 },
             ),
-            patch.object(launcher.subprocess, "call", return_value=0) as execute,
+            patch.object(launcher.os, "chdir"),
+            patch.object(launcher.os, "execve", side_effect=RuntimeError("exec")) as execute,
         ):
-            self.assertEqual(launcher.main(["--skip-update", "--", url]), 0)
-            self.assertEqual(execute.call_args.args[0][1:], [url])
-            self.assertNotIn("--no-sandbox", execute.call_args.args[0])
-            self.assertNotIn("APPIMAGE", execute.call_args.kwargs["env"])
-            self.assertNotIn("APPDIR", execute.call_args.kwargs["env"])
+            with self.assertRaisesRegex(RuntimeError, "exec"):
+                launcher.main(["--skip-update", "--", url])
+            self.assertEqual(execute.call_args.args[1][1:], [url])
+            self.assertNotIn("--no-sandbox", execute.call_args.args[1])
+            self.assertNotIn("APPIMAGE", execute.call_args.args[2])
+            self.assertNotIn("APPDIR", execute.call_args.args[2])
 
     def test_cli_offline_fallback(self):
         state = {}
@@ -307,12 +352,84 @@ class LauncherTests(unittest.TestCase):
         with (
             patch.dict(os.environ, {"XDG_DATA_HOME": str(self.root)}),
             patch.object(launcher, "release_metadata", side_effect=OSError("offline")),
-            patch.object(launcher.subprocess, "call", return_value=0) as execute,
+            patch.object(launcher, "show_error"),
+            patch.object(launcher.os, "chdir"),
+            patch.object(launcher.os, "execve", side_effect=RuntimeError("exec")) as execute,
         ):
-            self.assertEqual(launcher.main([]), 0)
+            with self.assertRaisesRegex(RuntimeError, "exec"):
+                launcher.main([])
             execute.assert_called_once()
             with self.assertRaises(launcher.LauncherError):
                 launcher.main(["--update"])
+
+    def test_resume_download_validates_range_and_checksum(self):
+        content = b"complete package"
+        release = launcher.parse_metadata(metadata(content), "amd64")
+
+        class Partial(io.BytesIO):
+            status = 206
+            headers = {"Content-Range": f"bytes 4-{len(content) - 1}/{len(content)}"}
+
+        with patch.object(
+            launcher, "open_url", side_effect=[io.BytesIO(content[:4]), Partial(content[4:])]
+        ) as fetch:
+            launcher.download(release, self.root / "resumed.deb")
+        self.assertEqual((self.root / "resumed.deb").read_bytes(), content)
+        self.assertEqual(fetch.call_args.kwargs["offset"], 4)
+
+    def test_server_ignoring_range_restarts_download(self):
+        content = b"complete package"
+        release = launcher.parse_metadata(metadata(content), "amd64")
+        with patch.object(
+            launcher, "open_url", side_effect=[io.BytesIO(content[:4]), io.BytesIO(content)]
+        ):
+            launcher.download(release, self.root / "restarted.deb")
+        self.assertEqual((self.root / "restarted.deb").read_bytes(), content)
+
+    def test_config_and_dry_run_preserve_arguments(self):
+        root = self.root / "paper-launcher"
+        root.mkdir()
+        self.installation = launcher.Installation(root)
+        self.update({})
+        config = self.root / "config"
+        config.mkdir()
+        (config / "paper-launcher.conf").write_text(
+            '[paper]\nextra_arguments = ["--ozone-platform=wayland"]\n'
+            'extra_env_vars = ["TEST_PAPER=value"]\ndownload_attempts = 3\n'
+        )
+        output = io.StringIO()
+        with (
+            patch.dict(
+                os.environ, {"XDG_DATA_HOME": str(self.root), "XDG_CONFIG_HOME": str(config)}
+            ),
+            patch("sys.stdout", output),
+            patch.object(launcher.subprocess, "call") as execute,
+        ):
+            self.assertEqual(launcher.main(["--skip-update", "--no-exec", "--", "paper://test"]), 0)
+            execute.assert_not_called()
+        self.assertIn("--ozone-platform=wayland", output.getvalue())
+        self.assertIn("paper://test", output.getvalue())
+
+    def test_invalid_config_rejected(self):
+        config = self.root / "config"
+        config.mkdir()
+        (config / "paper-launcher.conf").write_text('[paper]\nextra_env_vars = ["INVALID"]\n')
+        with (
+            patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config)}),
+            self.assertRaises(launcher.LauncherError),
+        ):
+            launcher.load_config()
+
+    def test_progress_failure_does_not_break_download(self):
+        content = b"package"
+        release = launcher.parse_metadata(metadata(content), "amd64")
+        with (
+            patch.dict(os.environ, {"DISPLAY": ":99"}),
+            patch.object(launcher.shutil, "which", return_value="/usr/bin/zenity"),
+            patch.object(launcher.subprocess, "Popen", side_effect=OSError("missing display")),
+            patch.object(launcher, "open_url", return_value=io.BytesIO(content)),
+        ):
+            launcher.download(release, self.root / "without-dialog.deb")
 
     def test_running_app_blocks_updates_but_allows_launch(self):
         state = {}
@@ -332,26 +449,82 @@ class LauncherTests(unittest.TestCase):
             try:
                 with (
                     patch.dict(os.environ, {"XDG_DATA_HOME": str(self.root)}),
-                    patch.object(launcher.subprocess, "call", return_value=0) as execute,
+                    patch.object(launcher.os, "chdir"),
+                    patch.object(
+                        launcher.os, "execve", side_effect=RuntimeError("exec")
+                    ) as execute,
                     patch.object(launcher, "release_metadata") as upstream,
                 ):
                     with self.assertRaises(launcher.LauncherError):
                         launcher.main(["--update"])
-                    self.assertEqual(launcher.main([]), 0)
+                    with self.assertRaisesRegex(RuntimeError, "exec"):
+                        launcher.main([])
                     execute.assert_called_once()
                     upstream.assert_not_called()
             finally:
                 process.communicate(timeout=5)
 
+    def test_exec_keeps_lock_until_application_exits(self):
+        root = self.root / "paper-launcher"
+        root.mkdir()
+        self.installation = launcher.Installation(root)
+        state = {}
+        self.update(state)
+        executable = self.installation.executable(state["current"])
+        assert executable is not None
+        executable.write_text("#!/bin/sh\necho ready\nread line\n")
+        script = (
+            "import paper_launcher as p; "
+            "p.shutil.which=lambda _: '/usr/bin/zenity'; "
+            "p.os.geteuid=lambda: 1000; p.main(['--skip-update'])"
+        )
+        environment = os.environ.copy()
+        environment.update(XDG_DATA_HOME=str(self.root), XDG_CONFIG_HOME=str(self.root))
+        with subprocess.Popen(
+            ["python3", "-c", script],
+            env=environment,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        ) as process:
+            try:
+                self.assertEqual(process.stdout.readline().strip(), "ready")
+                with (root / "launcher.lock").open("a+") as probe:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                process.communicate("done\n", timeout=5)
+                self.assertEqual(process.returncode, 0)
+                with (root / "launcher.lock").open("a+") as probe:
+                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.wait()
+
 
 class InstallerTests(unittest.TestCase):
+    def test_installer_requires_zenity_before_writing_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(Path, "home", return_value=root),
+                patch.object(install.shutil, "which", return_value=None),
+                self.assertRaisesRegex(ValueError, "Zenity is required"),
+            ):
+                install.install()
+            self.assertEqual(list(root.iterdir()), [])
+
     def test_install_is_idempotent_and_does_not_overwrite_user_files(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with (
                 patch.object(Path, "home", return_value=root),
                 patch.dict(os.environ, {"XDG_DATA_HOME": str(root / "data")}),
-                patch.object(install.shutil, "which", return_value=None),
+                patch.object(
+                    install.shutil,
+                    "which",
+                    side_effect=lambda name: "/usr/bin/zenity" if name == "zenity" else None,
+                ),
             ):
                 install.install()
                 install.install()
